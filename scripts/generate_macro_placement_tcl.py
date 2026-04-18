@@ -125,18 +125,98 @@ def _plc_extract_group_and_index(plc_name):
     return prefix, macro_idx
 
 
+def _write_generic_size_bucketed_tcl(size_buckets, output_file, total_macros):
+    """Generic macro placement TCL: pair ODB macros with .plc positions by master size.
+
+    Emits a TCL script that iterates every block instance in ODB, groups by
+    (master_width, master_height) in DBU, then for each bucket assigns the
+    pre-sorted list of .plc positions (sorted by x,y) in order.
+
+    This reproduces the placement's geometric distribution per-master-type.
+    It does NOT preserve the original plc-name → odb-name correspondence, so
+    within a size bucket macros may swap identities. This is a valid
+    OpenROAD baseline for the placement but not necessarily identical timing.
+    """
+    with open(output_file, 'w') as f:
+        f.write("# Macro Placement for OpenROAD-flow-scripts (generic size-bucketed)\n")
+        f.write("# Pairs ODB macros with .plc positions by (master_width, master_height).\n\n")
+
+        # Emit per-bucket position lists sorted by (x, y)
+        f.write("set _buckets [dict create]\n")
+        for key in sorted(size_buckets.keys()):
+            w_dbu100, h_dbu100 = key
+            entries = sorted(size_buckets[key], key=lambda e: (e[0], e[1]))
+            # key: "W_H" where both are in DBU*100 (um * 100 * 1 = nm*10, but DBU for nangate45 is 2000/um)
+            bucket_id = f"{w_dbu100}_{h_dbu100}"
+            f.write(f'# bucket {bucket_id}: {len(entries)} macros, master ~{w_dbu100/100.0}um x {h_dbu100/100.0}um\n')
+            f.write(f'dict set _buckets "{bucket_id}" [list \\\n')
+            for (x_ll, y_ll, orient, plc_name) in entries:
+                f.write(f'    [list {x_ll:.6f} {y_ll:.6f} {orient} "{plc_name}"] \\\n')
+            f.write("]\n")
+        f.write("\n")
+
+        f.write("""# Walk every block instance, pair it with the next position from its size bucket.
+set _placed 0
+set _unmatched [list]
+set _cursor [dict create]
+set block [ord::get_db_block]
+# Group ODB instances by size bucket, sort by instance name for determinism.
+set _odb_by_bucket [dict create]
+foreach inst [$block getInsts] {
+    if {![$inst isBlock]} { continue }
+    set master [$inst getMaster]
+    set mw [$master getWidth]
+    set mh [$master getHeight]
+    # Convert DBU to um*100 (DBU-per-um from ORD is usually 2000 for nangate45)
+    set dbu [[ord::get_db_tech] getDbUnitsPerMicron]
+    set w100 [expr {round(double($mw) / $dbu * 100.0)}]
+    set h100 [expr {round(double($mh) / $dbu * 100.0)}]
+    set bid "${w100}_${h100}"
+    dict lappend _odb_by_bucket $bid [$inst getName]
+}
+
+dict for {bid odb_names} $_odb_by_bucket {
+    # Sort ODB names so the cursor order is deterministic (numeric-aware).
+    set sorted_names [lsort -dictionary $odb_names]
+    set positions [expr {[dict exists $_buckets $bid] ? [dict get $_buckets $bid] : [list]}]
+    set n_pos [llength $positions]
+    set n_odb [llength $sorted_names]
+    if {$n_pos != $n_odb} {
+        puts "WARNING: bucket $bid size mismatch: $n_odb ODB instances vs $n_pos .plc positions"
+    }
+    set i 0
+    foreach name $sorted_names {
+        if {$i >= $n_pos} {
+            lappend _unmatched "$name (bucket=$bid, no position)"
+            incr i
+            continue
+        }
+        lassign [lindex $positions $i] x y orient plc_name
+        place_macro -macro_name [list $name] -location [list $x $y] -orientation $orient
+        incr _placed
+        incr i
+    }
+}
+
+""")
+        f.write(f'puts "Placed $_placed macros (expected {total_macros})"\n')
+        f.write('if {[llength $_unmatched] > 0} {\n')
+        f.write('    puts "Unmatched ODB instances:"\n')
+        f.write('    foreach u $_unmatched { puts "  $u" }\n')
+        f.write('}\n')
+    print(f"✓ Generated generic ORFS macro placement TCL: {output_file}")
+    print(f"  {total_macros} macros across {len(size_buckets)} size buckets")
+
+
 def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area=None):
     """
     Write macro placement in ORFS format using place_macro command.
 
-    Uses a two-pass TCL matching strategy to handle the naming differences
-    between .plc protobuf names and ODB/synthesized names:
-    - .plc uses flat indexing: macro_mem[K].i_ram (K=0..N-1)
-    - ODB uses generate blocks: genblk1_G__i_ram.macro_mem_M
-
-    The mapping K -> (G,M) depends on the SRAM wrapper type (4, 3, or 1 mems
-    per genblk). Instead of guessing, we match at runtime by grouping ODB
-    instances by their sram block prefix and assigning linear indices.
+    Tries the ariane-style name-matched placement first; if any macro name
+    doesn't match the `.../macro_mem[K].i_ram` pattern, falls back to a
+    generic (width, height)-bucket matcher that pairs .plc macros with ODB
+    instances by master size. Within a bucket, .plc entries are sorted by
+    (x, y) so the pairing is deterministic.
 
     Args:
         placement: [num_macros, 2] tensor of (x, y) positions in microns
@@ -151,7 +231,10 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
 
     # Build placement data keyed by (group_prefix, flat_macro_index)
     group_data = defaultdict(dict)  # group_prefix -> {K: (x, y, orient, plc_name)}
+    # Also collect a generic bucketed list for the fallback path
+    size_buckets = defaultdict(list)  # (w_um_100, h_um_100) -> [(x, y, orient, plc_name)]
     total_macros = 0
+    unparseable = 0
 
     for i, macro_idx in enumerate(benchmark.hard_macro_indices):
         node = plc.modules_w_pins[macro_idx]
@@ -169,13 +252,23 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
             y_ll = max(core_y_min + margin, min(y_ll, core_y_max - h - margin))
 
         orientation = node.get_orientation() if node.get_orientation() else "R0"
+        # Always populate the size-bucket list (used by the generic fallback)
+        bucket_key = (round(w * 100), round(h * 100))
+        size_buckets[bucket_key].append((float(x_ll), float(y_ll), orientation, plc_name))
+
         group_prefix, macro_k = _plc_extract_group_and_index(plc_name)
 
         if group_prefix is not None:
             group_data[group_prefix][macro_k] = (x_ll, y_ll, orientation, plc_name)
             total_macros += 1
         else:
-            print(f"  WARNING: Could not parse .plc name: {plc_name}")
+            unparseable += 1
+    # If any name was unparseable, switch to the generic size-bucketed path
+    if unparseable > 0:
+        total_macros = sum(len(v) for v in size_buckets.values())
+        print(f"  Using generic size-bucketed matcher ({unparseable} names did not match ariane pattern)")
+        return _write_generic_size_bucketed_tcl(size_buckets, output_file, total_macros)
+    # else: fall through to the ariane-style TCL below
 
     with open(output_file, 'w') as f:
         f.write("# Macro Placement for OpenROAD-flow-scripts\n")

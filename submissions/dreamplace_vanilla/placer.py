@@ -203,7 +203,10 @@ class DreamPlaceVanilla:
             "density_weight": self.density_weight,
             "gamma": 4.0,
             "random_seed": self.seed,
-            "scale_factor": 1.0,
+            # NG45 bookshelf is emitted in nm (µm × 1000); DREAMPlace numeric
+            # stability requires coordinates in low thousands, not millions.
+            # scale_factor=0.001 maps nm→µm internally.
+            "scale_factor": 0.001,
             "ignore_net_degree": 100,
             "enable_fillers": 0,  # our benchmark has no stdcells, disable fillers
             "gp_noise_ratio": 0.025,

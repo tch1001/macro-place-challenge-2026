@@ -313,6 +313,7 @@ def evaluate_benchmark(
     # Fallback: check ORFS built-in designs (maps source_name to ORFS design name)
     orfs_builtin_map = {
         'bp_quad': 'black_parrot',
+        'nvdla': 'nvdla',
     }
     if not orfs_config_dir.exists() and source_name in orfs_builtin_map:
         orfs_design_name_builtin = orfs_builtin_map[source_name]
