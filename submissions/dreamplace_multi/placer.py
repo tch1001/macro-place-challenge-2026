@@ -57,56 +57,59 @@ from macro_place.utils import validate_placement  # noqa: E402
 import numpy as np  # noqa: E402
 
 
-def _fix_touching_edges(pos: torch.Tensor, benchmark: Benchmark, eps: float = 0.01,
-                         max_passes: int = 50) -> torch.Tensor:
-    """Post-process to eliminate float-precision 'touching' overlaps.
+def _fix_touching_edges(pos: torch.Tensor, benchmark: Benchmark, eps: float = 0.005,
+                         max_passes: int = 400) -> torch.Tensor:
+    """Post-process to eliminate any strict-bbox overlap, including
+    float-precision 'touching' artifacts.
 
-    The standard validate_placement checks strict bbox overlap; macros that
-    touch at exact edges sometimes fail due to float32 precision (e.g.
-    13.44 stored as 13.44000001 vs 13.43999998). We nudge the smaller-id
-    macro of any touching pair by `eps` along the axis with smallest
-    overlap, until validate_placement passes or max_passes hit.
+    Strategy: use the port's iterative push-apart legalizer with a small
+    gap; if it doesn't fully resolve, fall back to greedy-slot placement
+    (spiral search around each macro's origin for a free spot).
+
+    Tries multiple shuffle seeds since push-apart is order-sensitive on
+    geometrically tight inputs (some IBM .plc initials require this).
     """
     n_hard = benchmark.num_hard_macros
+    canvas_w = benchmark.canvas_width
+    canvas_h = benchmark.canvas_height
     sizes = benchmark.macro_sizes.numpy()
     pos_np = pos.detach().cpu().numpy().copy()
 
-    for _ in range(max_passes):
-        ok, _ = validate_placement(torch.tensor(pos_np), benchmark)
+    movable = (benchmark.get_movable_mask().numpy()
+               if hasattr(benchmark, 'get_movable_mask')
+               else np.ones(benchmark.num_macros, dtype=bool))
+
+    best_fixed = None
+    best_viols = float('inf')
+
+    # Try several seeds; push-apart can fail to converge on tight inputs
+    # depending on the random shuffle order.
+    for s in [42, 0, 1, 2, 3, 7, 11]:
+        np.random.seed(s)
+        fixed = _port_mod._legalize_hard(
+            pos_np.copy(), sizes, n_hard, movable, canvas_w, canvas_h,
+            gap=eps, max_passes=max_passes,
+        )
+        ok, viol = validate_placement(torch.tensor(fixed, dtype=torch.float32), benchmark)
         if ok:
-            break
-        moved_any = False
-        for i in range(n_hard):
-            for j in range(i + 1, n_hard):
-                lx_i = pos_np[i, 0] - sizes[i, 0] / 2
-                ux_i = pos_np[i, 0] + sizes[i, 0] / 2
-                ly_i = pos_np[i, 1] - sizes[i, 1] / 2
-                uy_i = pos_np[i, 1] + sizes[i, 1] / 2
-                lx_j = pos_np[j, 0] - sizes[j, 0] / 2
-                ux_j = pos_np[j, 0] + sizes[j, 0] / 2
-                ly_j = pos_np[j, 1] - sizes[j, 1] / 2
-                uy_j = pos_np[j, 1] + sizes[j, 1] / 2
-                # Skip if not overlapping
-                if (lx_i >= ux_j or ux_i <= lx_j or ly_i >= uy_j or uy_i <= ly_j):
-                    continue
-                # Compute overlap depths in each axis
-                ovl_x = min(ux_i, ux_j) - max(lx_i, lx_j)
-                ovl_y = min(uy_i, uy_j) - max(ly_i, ly_j)
-                # Push along smaller-overlap axis to escape
-                if ovl_x <= ovl_y:
-                    if pos_np[i, 0] < pos_np[j, 0]:
-                        pos_np[j, 0] += ovl_x + eps
-                    else:
-                        pos_np[i, 0] += ovl_x + eps
-                else:
-                    if pos_np[i, 1] < pos_np[j, 1]:
-                        pos_np[j, 1] += ovl_y + eps
-                    else:
-                        pos_np[i, 1] += ovl_y + eps
-                moved_any = True
-        if not moved_any:
-            break
-    return torch.tensor(pos_np, dtype=pos.dtype)
+            return torch.tensor(fixed, dtype=pos.dtype)
+        if len(viol) < best_viols:
+            best_viols = len(viol)
+            best_fixed = fixed
+        # Try greedy_slot fallback as well
+        if _port_mod._has_hard_overlap(fixed, sizes, n_hard):
+            slot_fixed = _port_mod._greedy_slot(
+                fixed.copy(), sizes, n_hard, movable, canvas_w, canvas_h, gap=eps,
+            )
+            ok, viol = validate_placement(torch.tensor(slot_fixed, dtype=torch.float32), benchmark)
+            if ok:
+                return torch.tensor(slot_fixed, dtype=pos.dtype)
+            if len(viol) < best_viols:
+                best_viols = len(viol)
+                best_fixed = slot_fixed
+
+    # Couldn't fully clean; return the lowest-violation attempt
+    return torch.tensor(best_fixed if best_fixed is not None else pos_np, dtype=pos.dtype)
 
 
 def _try_load_plc_for_bench(benchmark: Benchmark):
