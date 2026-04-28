@@ -172,6 +172,7 @@ class DreamPlaceVanilla:
         seed: int = 1000,
         use_gpu: bool = False,
         work_dir: Optional[str] = None,
+        scale_factor: float = 1.0,
     ):
         self.num_bins = num_bins
         self.iterations = iterations
@@ -180,6 +181,7 @@ class DreamPlaceVanilla:
         self.seed = seed
         self.use_gpu = use_gpu
         self._work_dir = work_dir
+        self.scale_factor = scale_factor
 
     def _config(self, aux_path: str, out_dir: str) -> dict:
         return {
@@ -205,8 +207,9 @@ class DreamPlaceVanilla:
             "random_seed": self.seed,
             # NG45 bookshelf is emitted in nm (µm × 1000); DREAMPlace numeric
             # stability requires coordinates in low thousands, not millions.
-            # scale_factor=0.001 maps nm→µm internally.
-            "scale_factor": 0.001,
+            # Pass scale_factor=0.001 for NG45 (maps nm→µm internally); leave
+            # the default 1.0 for IBMs.
+            "scale_factor": self.scale_factor,
             "ignore_net_degree": 100,
             "enable_fillers": 0,  # our benchmark has no stdcells, disable fillers
             "gp_noise_ratio": 0.025,
