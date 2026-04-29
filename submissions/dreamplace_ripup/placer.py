@@ -218,6 +218,131 @@ class BinGrid:
             self.bin_demand[bx, by] += a
 
 
+class CongestionGrid:
+    """Per-bin net-bbox count tracker for incremental congestion estimates.
+
+    The proxy congestion penalizes regions where many net bounding boxes
+    overlap. We approximate this with sum-of-squared-bin-counts: each net
+    contributes 1 to every bin its bbox covers; sum over bins of count²
+    grows quadratically with stacking, so hot routing zones cost more.
+    """
+
+    def __init__(self, canvas_w: float, canvas_h: float, nbx: int = 32, nby: int = 32):
+        self.nbx = nbx
+        self.nby = nby
+        self.bin_w = canvas_w / nbx
+        self.bin_h = canvas_h / nby
+        self.bin_count = np.zeros((nbx, nby), dtype=np.int32)
+        # Per-net cached bbox-bin range (bx_lo, bx_hi, by_lo, by_hi); -1 = absent
+        self.net_bbox: dict[int, tuple] = {}
+
+    def _net_bbox_bins(self, pos_full: np.ndarray, pins: np.ndarray):
+        if len(pins) == 0:
+            return None
+        valid = pins[pins < pos_full.shape[0]]
+        if len(valid) == 0:
+            return None
+        xs = pos_full[valid, 0]
+        ys = pos_full[valid, 1]
+        x_lo = float(xs.min())
+        x_hi = float(xs.max())
+        y_lo = float(ys.min())
+        y_hi = float(ys.max())
+        bx_lo = max(0, int(x_lo // self.bin_w))
+        bx_hi = min(self.nbx, int(x_hi // self.bin_w) + 1)
+        by_lo = max(0, int(y_lo // self.bin_h))
+        by_hi = min(self.nby, int(y_hi // self.bin_h) + 1)
+        return (bx_lo, bx_hi, by_lo, by_hi)
+
+    def add_net(self, net_id: int, pos_full: np.ndarray, pins: np.ndarray):
+        bb = self._net_bbox_bins(pos_full, pins)
+        if bb is None:
+            return
+        bx_lo, bx_hi, by_lo, by_hi = bb
+        self.bin_count[bx_lo:bx_hi, by_lo:by_hi] += 1
+        self.net_bbox[net_id] = bb
+
+    def update_net(self, net_id: int, pos_full: np.ndarray, pins: np.ndarray):
+        old_bb = self.net_bbox.get(net_id)
+        if old_bb is not None:
+            bx_lo, bx_hi, by_lo, by_hi = old_bb
+            self.bin_count[bx_lo:bx_hi, by_lo:by_hi] -= 1
+        new_bb = self._net_bbox_bins(pos_full, pins)
+        if new_bb is not None:
+            bx_lo, bx_hi, by_lo, by_hi = new_bb
+            self.bin_count[bx_lo:bx_hi, by_lo:by_hi] += 1
+            self.net_bbox[net_id] = new_bb
+        elif old_bb is not None:
+            del self.net_bbox[net_id]
+
+    def cost(self) -> float:
+        return float((self.bin_count.astype(np.float64) ** 2).sum())
+
+    def cost_delta_for_swap(self, affected_nets, pos_full: np.ndarray, net_pins, idx: int,
+                            old_xy: np.ndarray, new_xy: np.ndarray) -> float:
+        """Return Δcost if macro idx moves from old_xy to new_xy.
+
+        Only the bins touched by `affected_nets` (nets connected to idx) can
+        change. We compute Δ by simulating the bbox updates without
+        materializing the full grid.
+        """
+        if not affected_nets:
+            return 0.0
+        # Snapshot the touched-bin counts so we can roll back
+        touched_bins: set = set()
+        net_old_new: list = []
+        # Collect old bboxes
+        for net_id in affected_nets:
+            old_bb = self.net_bbox.get(net_id)
+            if old_bb is not None:
+                bx_lo, bx_hi, by_lo, by_hi = old_bb
+                for bx in range(bx_lo, bx_hi):
+                    for by in range(by_lo, by_hi):
+                        touched_bins.add((bx, by))
+        # Move idx temporarily
+        save = pos_full[idx].copy()
+        pos_full[idx] = new_xy
+        # Compute new bboxes
+        new_bbs = {}
+        for net_id in affected_nets:
+            new_bb = self._net_bbox_bins(pos_full, net_pins[net_id])
+            new_bbs[net_id] = new_bb
+            if new_bb is not None:
+                bx_lo, bx_hi, by_lo, by_hi = new_bb
+                for bx in range(bx_lo, bx_hi):
+                    for by in range(by_lo, by_hi):
+                        touched_bins.add((bx, by))
+        pos_full[idx] = save
+        # Snapshot old counts for touched bins
+        old_counts = {(bx, by): int(self.bin_count[bx, by]) for bx, by in touched_bins}
+        # Apply diff: -1 for nets leaving each old bbox, +1 for nets joining new bbox
+        for net_id in affected_nets:
+            old_bb = self.net_bbox.get(net_id)
+            new_bb = new_bbs[net_id]
+            if old_bb == new_bb:
+                continue
+            if old_bb is not None:
+                bx_lo, bx_hi, by_lo, by_hi = old_bb
+                for bx in range(bx_lo, bx_hi):
+                    for by in range(by_lo, by_hi):
+                        old_counts[(bx, by)] -= 1
+            if new_bb is not None:
+                bx_lo, bx_hi, by_lo, by_hi = new_bb
+                for bx in range(bx_lo, bx_hi):
+                    for by in range(by_lo, by_hi):
+                        old_counts[(bx, by)] += 1
+        # Compute Δcost = Σ (new² - old²) over touched bins
+        delta = 0.0
+        for (bx, by), new_count in old_counts.items():
+            old_count = int(self.bin_count[bx, by])
+            delta += new_count * new_count - old_count * old_count
+        return delta
+
+    def commit_swap(self, affected_nets, pos_full: np.ndarray, net_pins):
+        for net_id in affected_nets:
+            self.update_net(net_id, pos_full, net_pins[net_id])
+
+
 # ---------------------------------------------------------------------------
 # Overlap check — fast for a single macro's new position
 # ---------------------------------------------------------------------------
@@ -262,6 +387,7 @@ def strategic_ripup(
     overlap_gap: float = 0.0,
     max_passes: int = 3,
     density_weight: float = 0.0,
+    congestion_weight: float = 0.0,
     nbx: int = 32,
     nby: int = 32,
     target_density: float = 0.7,
@@ -312,6 +438,16 @@ def strategic_ripup(
             d0 = bin_grid.density_cost()
             density_weight = (abs(cur_hpwl) / d0) if d0 > 0 else 0.0
 
+    cong_grid: Optional[CongestionGrid] = None
+    want_cong = congestion_weight != 0
+    if want_cong:
+        cong_grid = CongestionGrid(canvas_w, canvas_h, nbx, nby)
+        for net_id in range(num_nets):
+            cong_grid.add_net(net_id, pos_full, net_pins[net_id])
+        if congestion_weight < 0:
+            c0 = cong_grid.cost()
+            congestion_weight = (abs(cur_hpwl) / c0) if c0 > 0 else 0.0
+
     if verbose:
         d0 = bin_grid.density_cost() if bin_grid is not None else 0.0
         print(f"[ripup] starting HPWL={cur_hpwl:.4e}  density_cost={d0:.4e}  "
@@ -347,8 +483,12 @@ def strategic_ripup(
             if bin_grid is not None and density_weight > 0:
                 new_xyw = (new_xy[0], new_xy[1], s_i[0], s_i[1])
                 d_delta = bin_grid.density_delta_for_swap(old_xyw, new_xyw)
-                # density_delta > 0 means density got worse → subtract from gain
                 gain -= density_weight * d_delta
+            if cong_grid is not None and congestion_weight > 0:
+                c_delta = cong_grid.cost_delta_for_swap(
+                    nets, pos_full, net_pins, idx, old_xy, new_xy
+                )
+                gain -= congestion_weight * c_delta
             if gain > best_gain:
                 best_gain = gain
                 best_alt = k
@@ -397,6 +537,9 @@ def strategic_ripup(
             # Update bin grid
             if bin_grid is not None:
                 bin_grid.commit_swap(old_xyw, new_xyw)
+            # Update congestion grid (per-net bbox)
+            if cong_grid is not None:
+                cong_grid.commit_swap(node2nets[idx], pos_full, net_pins)
             swaps_applied += 1
             pass_swaps += 1
 
@@ -442,6 +585,7 @@ class DreamPlaceRipUp:
         ripup_passes: int = DEFAULT_RIPUP_PASSES,
         ripup_gap: float = 0.0,
         density_weight: float = -1.0,  # -1 = auto-balance to initial HPWL scale
+        congestion_weight: float = -1.0,  # -1 = auto-balance to initial HPWL scale
         nbx: int = 32,
         nby: int = 32,
         target_density: float = 0.7,
@@ -452,6 +596,7 @@ class DreamPlaceRipUp:
         self.ripup_passes = ripup_passes
         self.ripup_gap = ripup_gap
         self.density_weight = density_weight
+        self.congestion_weight = congestion_weight
         self.nbx = nbx
         self.nby = nby
         self.target_density = target_density
@@ -503,6 +648,7 @@ class DreamPlaceRipUp:
                 canvas_w=canvas_w, canvas_h=canvas_h, sizes=sizes,
                 overlap_gap=self.ripup_gap, max_passes=self.ripup_passes,
                 density_weight=self.density_weight,
+                congestion_weight=self.congestion_weight,
                 nbx=self.nbx, nby=self.nby, target_density=self.target_density,
                 verbose=self.verbose,
             )
