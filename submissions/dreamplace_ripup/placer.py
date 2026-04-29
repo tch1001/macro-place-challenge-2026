@@ -132,6 +132,93 @@ def _net_hpwl(pos_full: np.ndarray, pins: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Incremental density via bin-grid (rasterize macros, track per-bin demand)
+# ---------------------------------------------------------------------------
+
+class BinGrid:
+    """Per-bin macro-area tracker for incremental density-cost updates.
+
+    The proxy's density term is roughly `0.5 × avg(top-K densest bins)`.
+    We approximate that with sum-of-squared-overflow above a target density
+    — same shape penalty (heavier weight on hot bins), incrementally cheap.
+    """
+
+    def __init__(self, canvas_w: float, canvas_h: float, nbx: int = 32, nby: int = 32,
+                 target_density: float = 0.7):
+        self.nbx = nbx
+        self.nby = nby
+        self.bin_w = canvas_w / nbx
+        self.bin_h = canvas_h / nby
+        self.bin_area = self.bin_w * self.bin_h
+        self.bin_demand = np.zeros((nbx, nby), dtype=np.float64)
+        self.target = target_density * self.bin_area
+
+    def macro_contribs(self, x: float, y: float, w: float, h: float):
+        """Yield (bx, by, area) for the bins this macro overlaps."""
+        x_ll = x - w / 2
+        x_ur = x + w / 2
+        y_ll = y - h / 2
+        y_ur = y + h / 2
+        bx_lo = max(0, int(x_ll // self.bin_w))
+        bx_hi = min(self.nbx, int(x_ur // self.bin_w) + 1)
+        by_lo = max(0, int(y_ll // self.bin_h))
+        by_hi = min(self.nby, int(y_ur // self.bin_h) + 1)
+        for bx in range(bx_lo, bx_hi):
+            bin_x_ll = bx * self.bin_w
+            bin_x_ur = bin_x_ll + self.bin_w
+            ox = min(x_ur, bin_x_ur) - max(x_ll, bin_x_ll)
+            if ox <= 0:
+                continue
+            for by in range(by_lo, by_hi):
+                bin_y_ll = by * self.bin_h
+                bin_y_ur = bin_y_ll + self.bin_h
+                oy = min(y_ur, bin_y_ur) - max(y_ll, bin_y_ll)
+                if oy > 0:
+                    yield bx, by, ox * oy
+
+    def add(self, x: float, y: float, w: float, h: float):
+        for bx, by, a in self.macro_contribs(x, y, w, h):
+            self.bin_demand[bx, by] += a
+
+    def remove(self, x: float, y: float, w: float, h: float):
+        for bx, by, a in self.macro_contribs(x, y, w, h):
+            self.bin_demand[bx, by] -= a
+
+    def density_cost(self) -> float:
+        """Sum of squared overflow above target across all bins."""
+        ov = np.maximum(0.0, self.bin_demand - self.target)
+        return float((ov ** 2).sum())
+
+    def density_delta_for_swap(self, old_xyw, new_xyw) -> float:
+        """Return density_cost(after_swap) - density_cost(before_swap),
+        only touching bins affected by the move (no full grid scan)."""
+        ox, oy, ow, oh = old_xyw
+        nx, ny, nw, nh = new_xyw
+        # Collect affected bins
+        affected: dict = {}
+        for bx, by, a in self.macro_contribs(ox, oy, ow, oh):
+            affected[(bx, by)] = -a  # remove
+        for bx, by, a in self.macro_contribs(nx, ny, nw, nh):
+            affected[(bx, by)] = affected.get((bx, by), 0.0) + a
+        delta = 0.0
+        for (bx, by), da in affected.items():
+            old_d = self.bin_demand[bx, by]
+            new_d = old_d + da
+            old_ov = max(0.0, old_d - self.target)
+            new_ov = max(0.0, new_d - self.target)
+            delta += new_ov ** 2 - old_ov ** 2
+        return delta
+
+    def commit_swap(self, old_xyw, new_xyw):
+        ox, oy, ow, oh = old_xyw
+        nx, ny, nw, nh = new_xyw
+        for bx, by, a in self.macro_contribs(ox, oy, ow, oh):
+            self.bin_demand[bx, by] -= a
+        for bx, by, a in self.macro_contribs(nx, ny, nw, nh):
+            self.bin_demand[bx, by] += a
+
+
+# ---------------------------------------------------------------------------
 # Overlap check — fast for a single macro's new position
 # ---------------------------------------------------------------------------
 
@@ -174,6 +261,10 @@ def strategic_ripup(
     sizes: np.ndarray,
     overlap_gap: float = 0.0,
     max_passes: int = 3,
+    density_weight: float = 0.0,
+    nbx: int = 32,
+    nby: int = 32,
+    target_density: float = 0.7,
     verbose: bool = False,
 ) -> np.ndarray:
     """Strategic rip-up: greedy max-gain macro swaps across alternates.
@@ -204,40 +295,59 @@ def strategic_ripup(
     net_hpwl = np.array([_net_hpwl(pos_full, pins) for pins in net_pins])
     cur_hpwl = float(net_hpwl.sum())
 
+    # Bin grid for incremental density tracking — only built if density weight > 0
+    bin_grid: Optional[BinGrid] = None
+    if density_weight > 0:
+        bin_grid = BinGrid(canvas_w, canvas_h, nbx, nby, target_density)
+        for i in range(n_hard):
+            bin_grid.add(active[i, 0], active[i, 1], sizes[i, 0], sizes[i, 1])
+
+    # Auto-balance density weight if requested as -1: scale so initial
+    # density_cost ≈ initial HPWL (so they trade off comparably).
+    if density_weight < 0 and bin_grid is not None:
+        d0 = bin_grid.density_cost()
+        if d0 > 0:
+            density_weight = abs(cur_hpwl) / d0
+        else:
+            density_weight = 0.0
+
     if verbose:
-        print(f"[ripup] starting HPWL={cur_hpwl:.4e}  n_hard={n_hard}  K_alt={K_alt}")
+        d0 = bin_grid.density_cost() if bin_grid is not None else 0.0
+        print(f"[ripup] starting HPWL={cur_hpwl:.4e}  density_cost={d0:.4e}  "
+              f"density_weight={density_weight:.4e}  n_hard={n_hard}  K_alt={K_alt}")
 
     def gain_for(idx: int) -> Tuple[float, int]:
         """For macro idx, find best alternate and return (gain, alt_id).
 
-        gain > 0 means switching to alt reduces HPWL.
-        Constraints: alt position must be in-canvas and overlap-free.
+        gain = (cur_hpwl + α·cur_density) - (new_hpwl + α·new_density)
+        gain > 0 means swap reduces the combined HPWL+density cost.
         """
         s_i = sizes[idx]
-        # Cache nets touching this macro
         nets = node2nets[idx]
         if not nets:
             return (0.0, -1)
-        # Current contribution
         old_xy = pos_full[idx].copy()
-        cur_part = sum(net_hpwl[n] for n in nets)
+        cur_hpwl_part = sum(net_hpwl[n] for n in nets)
+        old_xyw = (old_xy[0], old_xy[1], s_i[0], s_i[1])
         best_gain = 0.0
         best_alt = -1
         for k, alt in enumerate(alternates):
             new_xy = alt[idx].astype(np.float64)
-            # Bounds check
             if (new_xy[0] - s_i[0] / 2 < 0 or new_xy[0] + s_i[0] / 2 > canvas_w or
                 new_xy[1] - s_i[1] / 2 < 0 or new_xy[1] + s_i[1] / 2 > canvas_h):
                 continue
-            # Apply temporarily
             pos_full[idx] = new_xy
-            # Overlap check
             if _macro_overlaps_anywhere(pos_full, sizes, n_hard, idx, overlap_gap):
                 pos_full[idx] = old_xy
                 continue
-            new_part = sum(_net_hpwl(pos_full, net_pins[n]) for n in nets)
+            new_hpwl_part = sum(_net_hpwl(pos_full, net_pins[n]) for n in nets)
             pos_full[idx] = old_xy
-            gain = cur_part - new_part
+            gain = cur_hpwl_part - new_hpwl_part
+            if bin_grid is not None and density_weight > 0:
+                new_xyw = (new_xy[0], new_xy[1], s_i[0], s_i[1])
+                d_delta = bin_grid.density_delta_for_swap(old_xyw, new_xyw)
+                # density_delta > 0 means density got worse → subtract from gain
+                gain -= density_weight * d_delta
             if gain > best_gain:
                 best_gain = gain
                 best_alt = k
@@ -275,11 +385,17 @@ def strategic_ripup(
             # Apply the swap
             new_xy = alternates[best_alt][idx].astype(np.float64).copy()
             old_xy = pos_full[idx].copy()
+            s_i = sizes[idx]
+            old_xyw = (old_xy[0], old_xy[1], s_i[0], s_i[1])
+            new_xyw = (new_xy[0], new_xy[1], s_i[0], s_i[1])
             pos_full[idx] = new_xy
             # Update affected net HPWLs
             for n in node2nets[idx]:
                 net_hpwl[n] = _net_hpwl(pos_full, net_pins[n])
             cur_hpwl = float(net_hpwl.sum())
+            # Update bin grid
+            if bin_grid is not None:
+                bin_grid.commit_swap(old_xyw, new_xyw)
             swaps_applied += 1
             pass_swaps += 1
 
@@ -324,12 +440,20 @@ class DreamPlaceRipUp:
         fillers: Optional[List[bool]] = None,
         ripup_passes: int = DEFAULT_RIPUP_PASSES,
         ripup_gap: float = 0.0,
+        density_weight: float = -1.0,  # -1 = auto-balance to initial HPWL scale
+        nbx: int = 32,
+        nby: int = 32,
+        target_density: float = 0.7,
         verbose: bool = False,
     ):
         self.seeds = list(seeds) if seeds is not None else list(self.DEFAULT_SEEDS)
         self.fillers = list(fillers) if fillers is not None else list(self.DEFAULT_FILLERS)
         self.ripup_passes = ripup_passes
         self.ripup_gap = ripup_gap
+        self.density_weight = density_weight
+        self.nbx = nbx
+        self.nby = nby
+        self.target_density = target_density
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -377,6 +501,8 @@ class DreamPlaceRipUp:
                 active, alternates, benchmark, plc,
                 canvas_w=canvas_w, canvas_h=canvas_h, sizes=sizes,
                 overlap_gap=self.ripup_gap, max_passes=self.ripup_passes,
+                density_weight=self.density_weight,
+                nbx=self.nbx, nby=self.nby, target_density=self.target_density,
                 verbose=self.verbose,
             )
 
