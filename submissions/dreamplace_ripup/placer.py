@@ -589,6 +589,9 @@ class DreamPlaceRipUp:
         nbx: int = 32,
         nby: int = 32,
         target_density: float = 0.7,
+        local_perturbation_alts: int = 10,
+        local_perturbation_sigma_frac: float = 0.03,
+        local_perturbation_seed: int = 7,
         verbose: bool = False,
     ):
         self.seeds = list(seeds) if seeds is not None else list(self.DEFAULT_SEEDS)
@@ -600,6 +603,9 @@ class DreamPlaceRipUp:
         self.nbx = nbx
         self.nby = nby
         self.target_density = target_density
+        self.local_perturbation_alts = local_perturbation_alts
+        self.local_perturbation_sigma_frac = local_perturbation_sigma_frac
+        self.local_perturbation_seed = local_perturbation_seed
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -639,6 +645,29 @@ class DreamPlaceRipUp:
         # Step 2: lowest-proxy is "active"; the rest are "alternates".
         active_label, active, _ = candidates[0]
         alternates = [c[1] for c in candidates[1:]]
+
+        # Augment alternates with LOCAL perturbations of active. Each
+        # perturbation array has every hard macro shifted by Gaussian noise
+        # in its own (sigma_frac × canvas) range — the rip-up loop then
+        # picks which macros benefit from their perturbed position.
+        if self.local_perturbation_alts > 0:
+            rng_pert = np.random.default_rng(self.local_perturbation_seed)
+            sigma_x = canvas_w * self.local_perturbation_sigma_frac
+            sigma_y = canvas_h * self.local_perturbation_sigma_frac
+            n_hard = benchmark.num_hard_macros
+            for k in range(self.local_perturbation_alts):
+                alt = active.copy()
+                noise = rng_pert.normal(0, [sigma_x, sigma_y], (n_hard, 2))
+                alt[:n_hard] += noise
+                # Clip into canvas
+                half_w = sizes[:n_hard, 0] / 2
+                half_h = sizes[:n_hard, 1] / 2
+                alt[:n_hard, 0] = np.clip(alt[:n_hard, 0], half_w, canvas_w - half_w)
+                alt[:n_hard, 1] = np.clip(alt[:n_hard, 1], half_h, canvas_h - half_h)
+                alternates.append(alt)
+            if self.verbose:
+                print(f"[ripup] +{self.local_perturbation_alts} local-perturbation alternates "
+                      f"(σ={self.local_perturbation_sigma_frac*100:.1f}% of canvas)")
 
         # Step 3: strategic rip-up.
         ripup_pos = active.copy()
