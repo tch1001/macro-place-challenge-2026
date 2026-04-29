@@ -297,19 +297,20 @@ def strategic_ripup(
 
     # Bin grid for incremental density tracking — only built if density weight > 0
     bin_grid: Optional[BinGrid] = None
-    if density_weight > 0:
+    # Build bin grid if we want density gain (density_weight != 0).
+    # Auto-balance scales α so initial HPWL ≈ initial density_cost. This
+    # works best at coarse grid sizes (32x32 default) where density_cost
+    # has a sensible magnitude. Fine grids (matched to plc) make density
+    # blow up, auto-balance compensates by making α tiny → density barely
+    # penalized (verified empirically on ibm10).
+    want_density = density_weight != 0
+    if want_density:
         bin_grid = BinGrid(canvas_w, canvas_h, nbx, nby, target_density)
         for i in range(n_hard):
             bin_grid.add(active[i, 0], active[i, 1], sizes[i, 0], sizes[i, 1])
-
-    # Auto-balance density weight if requested as -1: scale so initial
-    # density_cost ≈ initial HPWL (so they trade off comparably).
-    if density_weight < 0 and bin_grid is not None:
-        d0 = bin_grid.density_cost()
-        if d0 > 0:
-            density_weight = abs(cur_hpwl) / d0
-        else:
-            density_weight = 0.0
+        if density_weight < 0:
+            d0 = bin_grid.density_cost()
+            density_weight = (abs(cur_hpwl) / d0) if d0 > 0 else 0.0
 
     if verbose:
         d0 = bin_grid.density_cost() if bin_grid is not None else 0.0
