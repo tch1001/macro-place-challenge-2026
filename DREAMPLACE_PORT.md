@@ -11,9 +11,25 @@ Based on:
 
 ## Results — 17 IBM ICCAD04 benchmarks
 
-**Current best: avg proxy 1.3212**, beats vanilla DREAMPlace 4.3 (1.3452 per
-`submissions/dreamplace_vanilla/logs/eval_all.log`) by **1.79%**. Wins 10/17
-benches, loses 7/17.
+**Verified end-to-end through `python -m macro_place.evaluate`: avg proxy
+1.3276, all 17 valid (0 overlaps).** Versus the contest baselines: -37.5%
+vs SA, -8.9% vs RePlAce. Submission file:
+`submissions/dreamplace_multi/placer.py`.
+
+Position vs the public leaderboard (as of 2026-04-29):
+- #1 MTK (DreamPlace++): 1.3170
+- #2 RoRa (RipPlace):    1.3241
+- **#3 dreamplace_multi: 1.3276**
+
+(An earlier run hit avg 1.3255 but was DISQUALIFIED with 134 macro
+overlaps from float-precision touching on ibm01/06/08 initial placements.
+The legalize-fix in `dreamplace_multi.placer._fix_touching_edges` adds
++0.002 to the avg but gets to 0 overlaps across all 17 benches.)
+
+A run_sweep.py-driven multi-config sweep (with offline plc evaluation and
+no validate post-process) reaches **1.3212** — beats vanilla DREAMPlace
+4.3 (1.3452) by 1.79%. The contest entry has to live with the 0-overlap
+constraint enforced by `validate_placement`.
 
 ```
                        proxy
