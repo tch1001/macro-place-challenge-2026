@@ -47,6 +47,21 @@ This is *engineering* (combining two existing ideas) rather than a brand
 new algorithm, but the rip-up paradigm has not been systematically
 applied to macro placement in the public literature, so it counts as a
 genuine novelty in scope.
+
+STATUS (2026-04-29): smoke test on ibm10 hit proxy 1.3367 vs multi-config
+alone's 1.2748 — REGRESSION of 4.9%. The HPWL-only gain estimator is too
+coarse: it pushes macros toward shorter wires but ignores density and
+congestion, which together dominate the proxy at the same combined
+weight as HPWL. The placer's final candidate selection always re-evaluates
+{ripup, active, initial+fix} with full proxy, so worst case it falls
+back to the active multi-config result — in practice the regression
+above means the rip-up's "ripup" candidate became best (likely due to
+some active-candidate bumping during legalize-fix that I haven't traced).
+TO MAKE RIP-UP COMPETITIVE: extend the gain function with incremental
+density (and ideally congestion) deltas. Each macro contributes to ~9
+bins; maintain per-bin macro-area, recompute affected bins on swap,
+sort top-K for the proxy density approximation. ~30-50 lines more.
+Until that's in, dreamplace_multi is the better submission.
 """
 from __future__ import annotations
 
