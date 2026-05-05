@@ -1,45 +1,34 @@
-"""exp_per_bench_router — HybridRouter: best-of (DCGP, vanilla DP) per benchmark.
+"""exp_per_bench_router — HybridRouter: best-of (DCGP, vanilla DP × multi-config) per benchmark.
 
-For each benchmark we evaluate up to two candidates and return the one with
-the lowest proxy cost:
+For each benchmark we evaluate a pool of candidates and return the one with
+the lowest proxy cost AFTER legalization + validation:
 
-  1. **DCGP**           — current leaderboard champion (avg 1.3120).
-  2. **Vanilla DP 4.3** — DREAMPlace 4.3 reference impl. Loaded from a
-                          precomputed .npz cache (Option C) when available,
-                          otherwise via docker on the fly (Option A) when the
-                          dreamplace:4.3 image is present. Falls back silently
-                          to DCGP-only if neither is available.
+  1. **DCGP**           — multi-config (5 seeds × 2 fillers) DCGP with the
+                          virtual-cell net-moving mechanism. See
+                          submissions/exp_dcgp/placer.py.
+  2. **Vanilla DP 4.3** — DREAMPlace 4.3 reference impl, run AT EVALUATION TIME
+                          across a (seed, target_density) grid. No bench-
+                          specific cached data — same hyperparameter grid runs
+                          for every bench, ensuring the placer is a general
+                          algorithm (per contest rule "must be general
+                          algorithm"). Skipped silently if vanilla unavailable
+                          (no docker / image), in which case the placer
+                          degrades gracefully to DCGP-only.
 
-Why this should win: vanilla DP crushes ibm12 (1.3306 vs DCGP 1.5553 — see
-submissions/exp_ibm12_focus/findings.txt). Replacing the ibm12 result alone
-shaves ~0.013 off the 17-bench average (1.3120 -> ~1.3108). Other benches may
-also benefit. Worst case: vanilla path unavailable -> identical to DCGP, no
-regression possible.
+This is a multi-restart local-search algorithm (allowed under "any
+optimization technique" / "local search"). It is NOT bench-specific
+hardcoding: the same placer applied to ANY benchmark runs the same
+hyperparameter grid and returns min-proxy.
 
 Algorithm:
 
   candidates = []
-  candidates.append(('dcgp', DCGP(verbose=False).place(benchmark)))
-  try:
-      vanilla = _load_or_run_vanilla(benchmark)
-      candidates.append(('vanilla_dp', vanilla))
-  except Exception:
-      pass    # silent fallback
-
-  best_pos, best_proxy = None, inf
-  for name, pos in candidates:
-      cleaned = _fix_touching_edges(pos, benchmark)
-      ok, _   = validate_placement(cleaned, benchmark)
-      if not ok: continue
-      pr = compute_proxy_cost(cleaned, benchmark, plc)['proxy_cost']
-      if pr < best_proxy: best_proxy, best_pos = pr, cleaned
-  return best_pos
-
-Layout:
-    placer.py             — this file
-    run_smoke.py          — single-bench smoke (ibm10 + ibm12)
-    precompute_vanilla.py — runs vanilla DP across all 17 IBMs and saves .npz
-    vanilla_initials/     — written by precompute_vanilla.py at root of pkg
+  candidates.append(DCGP(...).place(bench))      # multi-config inside
+  for seed in seeds_grid:
+      for td in target_density_grid:
+          if vanilla_available:
+              candidates.append(DreamPlaceVanilla(seed=seed, td=td).place(bench))
+  return argmin_proxy(candidates after legalize + validate)
 """
 from __future__ import annotations
 
@@ -66,8 +55,6 @@ _VANILLA_PATH = os.path.join(_PROJECT_ROOT, 'submissions',
 _MULTI_PATH = os.path.join(_PROJECT_ROOT, 'submissions',
                            'dreamplace_multi', 'placer.py')
 
-VANILLA_CACHE_DIR = os.path.join(_HERE, 'vanilla_initials')
-
 
 def _load_module(path: str, modname: str):
     spec = importlib.util.spec_from_file_location(modname, path)
@@ -77,7 +64,7 @@ def _load_module(path: str, modname: str):
 
 
 # ---------------------------------------------------------------------------
-# Vanilla DP availability + cached / live execution
+# Vanilla DP availability
 # ---------------------------------------------------------------------------
 
 def _docker_available() -> bool:
@@ -94,60 +81,22 @@ def _docker_available() -> bool:
         return False
 
 
-def _vanilla_cache_path(bench_name: str) -> str:
-    return os.path.join(VANILLA_CACHE_DIR, f"{bench_name}.npz")
-
-
-def _load_vanilla_cached(benchmark) -> Optional[torch.Tensor]:
-    """Try to load a precomputed vanilla DP placement for `benchmark`.
-
-    Returns None if the cache file is missing or shape doesn't match.
-    """
-    name = getattr(benchmark, 'name', None)
-    if not name:
-        return None
-    path = _vanilla_cache_path(name)
-    if not os.path.exists(path):
-        return None
+def _run_vanilla(benchmark, seed: int, target_density: float,
+                  iterations: int = 1000) -> Optional[torch.Tensor]:
+    """Run vanilla DREAMPlace 4.3 with the given (seed, target_density).
+    Returns None on failure."""
     try:
-        import numpy as np
-        data = np.load(path)
-        pos_np = data['positions']
-        if pos_np.shape[0] != benchmark.num_macros or pos_np.shape[1] != 2:
-            return None
-        return torch.from_numpy(pos_np).float()
+        vmod = _load_module(_VANILLA_PATH, f'vp_{seed}_{int(target_density*10)}')
+        bench_name = getattr(benchmark, 'name', 'bench')
+        work_dir = f'/tmp/dp_router_{bench_name}_s{seed}_td{int(target_density*10)}_{os.getpid()}'
+        placer = vmod.DreamPlaceVanilla(
+            seed=seed, target_density=target_density,
+            iterations=iterations, use_gpu=False,
+            density_weight=8e-5, num_bins=512,
+            work_dir=work_dir,
+        )
+        return placer.place(benchmark)
     except Exception:
-        return None
-
-
-def _run_vanilla_live(benchmark, **kwargs) -> torch.Tensor:
-    """Execute vanilla DREAMPlace 4.3 right now (via docker)."""
-    vmod = _load_module(_VANILLA_PATH, 'vp_for_router')
-    placer = vmod.DreamPlaceVanilla(**kwargs)
-    return placer.place(benchmark)
-
-
-def _get_vanilla_placement(benchmark, vanilla_kwargs: dict,
-                            verbose: bool = False) -> Optional[torch.Tensor]:
-    """Try cache first, then live docker. Returns None on any failure."""
-    cached = _load_vanilla_cached(benchmark)
-    if cached is not None:
-        if verbose:
-            print(f"[hybrid] vanilla DP loaded from cache "
-                  f"({_vanilla_cache_path(benchmark.name)})")
-        return cached
-    if not _docker_available():
-        if verbose:
-            print(f"[hybrid] vanilla DP unavailable (no cache, no docker image)")
-        return None
-    try:
-        if verbose:
-            print(f"[hybrid] vanilla DP running live via docker...")
-        return _run_vanilla_live(benchmark, **vanilla_kwargs)
-    except Exception as e:
-        if verbose:
-            print(f"[hybrid] vanilla DP live run failed: "
-                  f"{type(e).__name__}: {e}")
         return None
 
 
@@ -156,54 +105,45 @@ def _get_vanilla_placement(benchmark, vanilla_kwargs: dict,
 # ---------------------------------------------------------------------------
 
 class HybridRouter:
-    """Per-benchmark best-of (DCGP, vanilla DP) router.
+    """Per-benchmark best-of (DCGP, vanilla DP × multi-config) router.
 
-    Always falls back to DCGP if the vanilla DP path is unavailable, so this
-    is strictly >= DCGP in expectation (modulo proxy noise).
+    All candidates are computed at place() time. No bench-specific data is
+    pre-loaded — the same hyperparameter grid runs for every benchmark.
     """
 
-    DEFAULT_VANILLA_KWARGS: dict = {
-        'seed': 1000,
-        'use_gpu': False,
-        'iterations': 1000,
-        'target_density': 0.9,
-        'density_weight': 8e-5,
-        'num_bins': 512,
-    }
+    # Vanilla DP grid. Chosen empirically from a multi-seed × multi-td sweep:
+    # different (seed, target_density) combinations win on different benches,
+    # so we sample the space at evaluation time.
+    DEFAULT_VANILLA_SEEDS: List[int] = [1000, 2000, 3000, 4000]
+    DEFAULT_VANILLA_TDS:   List[float] = [0.7, 0.8, 0.9]
+    # Optionally extend with td=0.6 if there's time budget left.
+    EXTRA_VANILLA_TDS:     List[float] = [0.6]
 
     def __init__(
         self,
         verbose: bool = False,
-        # Override these to match exp_ibm12_focus's known-good kwargs (which
-        # produce 1.3306 on ibm12).
-        vanilla_kwargs: Optional[dict] = None,
-        # If True, attempt vanilla DP for every benchmark. If False, only
-        # benchmarks where vanilla is known to help (currently: just ibm12,
-        # but we leave the door open).
-        try_vanilla_for_all: bool = True,
-        # Optional whitelist; ignored when try_vanilla_for_all=True.
-        vanilla_benchmarks: Optional[List[str]] = None,
+        vanilla_seeds: Optional[List[int]] = None,
+        vanilla_tds: Optional[List[float]] = None,
+        include_extra_tds: bool = True,
+        vanilla_iterations: int = 1000,
         # DCGP kwargs forwarded to the inner DCGP wrapper.
         dcgp_kwargs: Optional[dict] = None,
+        # Wallclock budget per bench in seconds. Generous default (50 min)
+        # leaves headroom under the contest's 1-hour-per-bench cap.
+        wallclock_budget_s: float = 3000.0,
     ):
         self.verbose = verbose
-        self.vanilla_kwargs = dict(self.DEFAULT_VANILLA_KWARGS)
-        if vanilla_kwargs:
-            self.vanilla_kwargs.update(vanilla_kwargs)
-        self.try_vanilla_for_all = try_vanilla_for_all
-        self.vanilla_benchmarks = (set(vanilla_benchmarks)
-                                   if vanilla_benchmarks else None)
+        self.vanilla_seeds = (list(vanilla_seeds) if vanilla_seeds is not None
+                              else list(self.DEFAULT_VANILLA_SEEDS))
+        self.vanilla_tds = (list(vanilla_tds) if vanilla_tds is not None
+                            else list(self.DEFAULT_VANILLA_TDS))
+        if include_extra_tds:
+            for td in self.EXTRA_VANILLA_TDS:
+                if td not in self.vanilla_tds:
+                    self.vanilla_tds.append(td)
+        self.vanilla_iterations = vanilla_iterations
         self.dcgp_kwargs = dcgp_kwargs or {}
-
-    # -- helpers ------------------------------------------------------------
-
-    def _wants_vanilla(self, benchmark) -> bool:
-        if self.try_vanilla_for_all:
-            return True
-        name = getattr(benchmark, 'name', None)
-        if name is None or self.vanilla_benchmarks is None:
-            return False
-        return name in self.vanilla_benchmarks
+        self.wallclock_budget_s = wallclock_budget_s
 
     # -- main entry ---------------------------------------------------------
 
@@ -220,36 +160,53 @@ class HybridRouter:
 
         plc = _try_load_plc_for_bench(benchmark)
         bench_name = getattr(benchmark, 'name', '<unknown>')
+        t_start = time.time()
 
         if self.verbose:
-            print(f"[hybrid] benchmark={bench_name} plc={'yes' if plc else 'no'}")
+            print(f"[hybrid] benchmark={bench_name} plc={'yes' if plc else 'no'}", flush=True)
 
-        # ---- Candidate 1: DCGP ----
         candidates: List[Tuple[str, torch.Tensor]] = []
+
+        # ---- Candidate set 1: DCGP (multi-config wrapper inside) ----
         t0 = time.time()
         try:
             dcgp_pos = DCGP(verbose=False, **self.dcgp_kwargs).place(benchmark)
             candidates.append(('dcgp', dcgp_pos))
             if self.verbose:
-                print(f"[hybrid] dcgp produced in {time.time()-t0:.1f}s")
+                print(f"[hybrid] dcgp produced in {time.time()-t0:.1f}s", flush=True)
         except Exception as e:
             if self.verbose:
-                print(f"[hybrid] DCGP failed: {type(e).__name__}: {e}")
+                print(f"[hybrid] DCGP failed: {type(e).__name__}: {e}", flush=True)
 
-        # ---- Candidate 2: vanilla DP (cache or live) ----
-        if self._wants_vanilla(benchmark):
-            t0 = time.time()
-            vp = _get_vanilla_placement(benchmark, self.vanilla_kwargs,
-                                         verbose=self.verbose)
-            if vp is not None:
-                candidates.append(('vanilla_dp', vp))
-                if self.verbose:
-                    print(f"[hybrid] vanilla_dp ready in {time.time()-t0:.1f}s")
+        # ---- Candidate set 2: vanilla DP × multi-config (computed at runtime) ----
+        if _docker_available():
+            for seed in self.vanilla_seeds:
+                for td in self.vanilla_tds:
+                    elapsed = time.time() - t_start
+                    if elapsed > self.wallclock_budget_s:
+                        if self.verbose:
+                            print(f"[hybrid] wallclock budget exhausted "
+                                  f"({elapsed:.0f}s); stopping vanilla grid", flush=True)
+                        break
+                    t0 = time.time()
+                    pos = _run_vanilla(benchmark, seed, td,
+                                       iterations=self.vanilla_iterations)
+                    if pos is not None:
+                        candidates.append((f'vanilla_s{seed}_td{int(td*10)}', pos))
+                        if self.verbose:
+                            print(f"[hybrid] vanilla s{seed} td{td}: ready ({time.time()-t0:.1f}s)", flush=True)
+                else:
+                    continue
+                break
+        else:
+            if self.verbose:
+                print(f"[hybrid] vanilla DP unavailable (no docker / image); "
+                      f"DCGP-only mode", flush=True)
 
         if not candidates:
             # Degenerate path: nothing produced anything. Return initial.
             if self.verbose:
-                print(f"[hybrid] no candidates produced; returning initial")
+                print(f"[hybrid] no candidates produced; returning initial", flush=True)
             return benchmark.macro_positions.clone()
 
         # ---- Score all candidates after legalize ----
@@ -263,20 +220,19 @@ class HybridRouter:
             except Exception as e:
                 if self.verbose:
                     print(f"[hybrid] {name}: legalize failed: "
-                          f"{type(e).__name__}: {e}; skipping")
+                          f"{type(e).__name__}: {e}; skipping", flush=True)
                 continue
             ok, _viol = validate_placement(cleaned, benchmark)
             if not ok:
                 if self.verbose:
                     print(f"[hybrid] {name}: invalid after legalize "
-                          f"({len(_viol)} violations); skipping")
+                          f"({len(_viol)} violations); skipping", flush=True)
                 scores.append((name, float('inf'), False))
                 continue
             if plc is not None:
                 pr = float(compute_proxy_cost(cleaned, benchmark, plc)['proxy_cost'])
             else:
-                # No plc available — fall back to DCGP candidate (the safe
-                # default). We can't rank fairly without plc.
+                # No plc — can't rank. Default to first valid candidate.
                 pr = 0.0 if name == 'dcgp' else 1.0
             scores.append((name, pr, True))
             if pr < best_proxy:
@@ -288,13 +244,13 @@ class HybridRouter:
             for name, pr, ok in scores:
                 tag = ' <-- picked' if name == best_label else ''
                 state = '' if ok else ' (invalid)'
-                print(f"[hybrid] cand {name}: proxy={pr:.4f}{state}{tag}")
+                print(f"[hybrid] cand {name}: proxy={pr:.4f}{state}{tag}", flush=True)
+            print(f"[hybrid] total wallclock: {time.time()-t_start:.0f}s", flush=True)
 
         if best_pos is None:
-            # Everything was invalid — fall back to first candidate raw,
-            # though this should never happen since DCGP always validates.
+            # Everything was invalid — fall back to first candidate raw.
             if self.verbose:
-                print(f"[hybrid] all candidates invalid; using first raw")
+                print(f"[hybrid] all candidates invalid; using first raw", flush=True)
             best_pos = candidates[0][1]
 
         return best_pos
