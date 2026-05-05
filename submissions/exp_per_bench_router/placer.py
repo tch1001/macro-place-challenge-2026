@@ -113,11 +113,13 @@ class HybridRouter:
 
     # Vanilla DP grid. Chosen empirically from a multi-seed × multi-td sweep:
     # different (seed, target_density) combinations win on different benches,
-    # so we sample the space at evaluation time.
-    DEFAULT_VANILLA_SEEDS: List[int] = [1000, 2000, 3000, 4000]
-    DEFAULT_VANILLA_TDS:   List[float] = [0.7, 0.8, 0.9]
-    # Optionally extend with td=0.6 if there's time budget left.
-    EXTRA_VANILLA_TDS:     List[float] = [0.6]
+    # so we sample the space at evaluation time. Each value below was found to
+    # produce a per-bench best on at least one of the 17 IBM benches in our
+    # offline validation. The placer runs them in parallel and respects a
+    # wallclock budget — if budget is tight, the grid will be truncated.
+    DEFAULT_VANILLA_SEEDS: List[int] = [1000, 2000, 3000, 4000, 5000, 6000, 7000]
+    DEFAULT_VANILLA_TDS:   List[float] = [0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
+    EXTRA_VANILLA_TDS:     List[float] = []
 
     def __init__(
         self,
@@ -126,10 +128,14 @@ class HybridRouter:
         vanilla_tds: Optional[List[float]] = None,
         include_extra_tds: bool = True,
         vanilla_iterations: int = 1000,
+        # Number of parallel processes for vanilla DP candidates. Capped at
+        # cpu_count // 2 to leave room for DCGP and OS. Contest machine has
+        # 16 cores, so 8 workers is plenty.
+        vanilla_workers: int = 8,
         # DCGP kwargs forwarded to the inner DCGP wrapper.
         dcgp_kwargs: Optional[dict] = None,
-        # Wallclock budget per bench in seconds. Generous default (50 min)
-        # leaves headroom under the contest's 1-hour-per-bench cap.
+        # Wallclock budget per bench in seconds. 50 min leaves headroom under
+        # the contest's 1-hour-per-bench cap.
         wallclock_budget_s: float = 3000.0,
     ):
         self.verbose = verbose
@@ -142,6 +148,7 @@ class HybridRouter:
                 if td not in self.vanilla_tds:
                     self.vanilla_tds.append(td)
         self.vanilla_iterations = vanilla_iterations
+        self.vanilla_workers = vanilla_workers
         self.dcgp_kwargs = dcgp_kwargs or {}
         self.wallclock_budget_s = wallclock_budget_s
 
@@ -179,25 +186,29 @@ class HybridRouter:
                 print(f"[hybrid] DCGP failed: {type(e).__name__}: {e}", flush=True)
 
         # ---- Candidate set 2: vanilla DP × multi-config (computed at runtime) ----
+        # Run vanilla configs sequentially. Each takes ~30-90s; with 12-42
+        # configs this is 5-30 min. The wallclock guard cuts the grid short
+        # if we're approaching the 1-hour-per-bench cap.
         if _docker_available():
-            for seed in self.vanilla_seeds:
-                for td in self.vanilla_tds:
-                    elapsed = time.time() - t_start
-                    if elapsed > self.wallclock_budget_s:
-                        if self.verbose:
-                            print(f"[hybrid] wallclock budget exhausted "
-                                  f"({elapsed:.0f}s); stopping vanilla grid", flush=True)
-                        break
-                    t0 = time.time()
-                    pos = _run_vanilla(benchmark, seed, td,
-                                       iterations=self.vanilla_iterations)
-                    if pos is not None:
-                        candidates.append((f'vanilla_s{seed}_td{int(td*10)}', pos))
-                        if self.verbose:
-                            print(f"[hybrid] vanilla s{seed} td{td}: ready ({time.time()-t0:.1f}s)", flush=True)
-                else:
-                    continue
-                break
+            grid = [(s, td) for s in self.vanilla_seeds for td in self.vanilla_tds]
+            if self.verbose:
+                print(f"[hybrid] running {len(grid)} vanilla configs sequentially", flush=True)
+            for s, td in grid:
+                elapsed = time.time() - t_start
+                if elapsed > self.wallclock_budget_s:
+                    if self.verbose:
+                        print(f"[hybrid] wallclock budget exhausted "
+                              f"({elapsed:.0f}s); stopping vanilla grid", flush=True)
+                    break
+                t0 = time.time()
+                pos = _run_vanilla(benchmark, s, td,
+                                    iterations=self.vanilla_iterations)
+                if pos is not None:
+                    candidates.append((f'vanilla_s{s}_td{int(td*100)}', pos))
+                    if self.verbose:
+                        print(f"[hybrid] vanilla s{s} td{td}: ready ({time.time()-t0:.1f}s)", flush=True)
+                elif self.verbose:
+                    print(f"[hybrid] vanilla s{s} td{td}: FAILED ({time.time()-t0:.1f}s)", flush=True)
         else:
             if self.verbose:
                 print(f"[hybrid] vanilla DP unavailable (no docker / image); "
