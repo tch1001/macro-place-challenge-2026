@@ -175,9 +175,15 @@ class HybridRouter:
         candidates: List[Tuple[str, torch.Tensor]] = []
 
         # ---- Candidate set 1: DCGP (multi-config wrapper inside) ----
+        # Use a wider seed grid by default — offline validation showed seeds
+        # 6000-10000 often find lower minima on big benches (ibm14, ibm15).
+        dcgp_kw = {'seeds': [1000, 2000, 3000, 4000, 5000, 6000, 7000],
+                   'fillers': [False, True],
+                   'include_vanilla_dp': False}
+        dcgp_kw.update(self.dcgp_kwargs)
         t0 = time.time()
         try:
-            dcgp_pos = DCGP(verbose=False, **self.dcgp_kwargs).place(benchmark)
+            dcgp_pos = DCGP(verbose=False, **dcgp_kw).place(benchmark)
             candidates.append(('dcgp', dcgp_pos))
             if self.verbose:
                 print(f"[hybrid] dcgp produced in {time.time()-t0:.1f}s", flush=True)
