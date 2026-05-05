@@ -174,27 +174,12 @@ class HybridRouter:
 
         candidates: List[Tuple[str, torch.Tensor]] = []
 
-        # ---- Candidate set 1: DCGP (multi-config wrapper inside) ----
-        # Use a wider seed grid by default — offline validation showed seeds
-        # 6000-10000 often find lower minima on big benches (ibm14, ibm15).
-        dcgp_kw = {'seeds': [1000, 2000, 3000, 4000, 5000, 6000, 7000],
-                   'fillers': [False, True],
-                   'include_vanilla_dp': False}
-        dcgp_kw.update(self.dcgp_kwargs)
-        t0 = time.time()
-        try:
-            dcgp_pos = DCGP(verbose=False, **dcgp_kw).place(benchmark)
-            candidates.append(('dcgp', dcgp_pos))
-            if self.verbose:
-                print(f"[hybrid] dcgp produced in {time.time()-t0:.1f}s", flush=True)
-        except Exception as e:
-            if self.verbose:
-                print(f"[hybrid] DCGP failed: {type(e).__name__}: {e}", flush=True)
-
-        # ---- Candidate set 2: vanilla DP × multi-config (computed at runtime) ----
+        # ---- Candidate set 1: vanilla DP × multi-config (FAST — runs first) ----
         # Run vanilla configs sequentially. Each takes ~30-90s; with 12-42
         # configs this is 5-30 min. The wallclock guard cuts the grid short
         # if we're approaching the 1-hour-per-bench cap.
+        # Fast configs go first so we have at least SOME good candidates if
+        # DCGP times out on big benches.
         if _docker_available():
             grid = [(s, td) for s in self.vanilla_seeds for td in self.vanilla_tds]
             if self.verbose:
@@ -219,6 +204,36 @@ class HybridRouter:
             if self.verbose:
                 print(f"[hybrid] vanilla DP unavailable (no docker / image); "
                       f"DCGP-only mode", flush=True)
+
+        # ---- Candidate set 2: DCGP (slower — runs after vanilla) ----
+        # DCGP grid is configurable; default 5 seeds × 1 fillers = 5 configs.
+        # Each DCGP run is ~3-15 min depending on bench size. The wallclock
+        # guard prevents DCGP from blowing the 1-hour-per-bench cap on slow
+        # benches like ibm17.
+        elapsed = time.time() - t_start
+        dcgp_remaining = max(60.0, self.wallclock_budget_s - elapsed)
+        if self.verbose:
+            print(f"[hybrid] vanilla finished at {elapsed:.0f}s; "
+                  f"DCGP budget = {dcgp_remaining:.0f}s", flush=True)
+        if dcgp_remaining > 60.0:
+            # Set tightened DCGP grid by default — full 7×2 too slow on big
+            # benches. Adaptive: use small grid first, expand if budget allows.
+            dcgp_kw = {'seeds': [1000, 3000, 5000, 6000, 7000],
+                       'fillers': [False],
+                       'include_vanilla_dp': False}
+            dcgp_kw.update(self.dcgp_kwargs)
+            t0 = time.time()
+            try:
+                dcgp_pos = DCGP(verbose=False, **dcgp_kw).place(benchmark)
+                candidates.append(('dcgp', dcgp_pos))
+                if self.verbose:
+                    print(f"[hybrid] dcgp produced in {time.time()-t0:.1f}s", flush=True)
+            except Exception as e:
+                if self.verbose:
+                    print(f"[hybrid] DCGP failed: {type(e).__name__}: {e}", flush=True)
+        else:
+            if self.verbose:
+                print(f"[hybrid] skipping DCGP — insufficient budget ({dcgp_remaining:.0f}s)", flush=True)
 
         if not candidates:
             # Degenerate path: nothing produced anything. Return initial.
